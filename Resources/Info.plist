@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>Assist</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.sudhan.assist</string>
+    <key>CFBundleName</key>
+    <string>Assist</string>
+    <key>CFBundleDisplayName</key>
+    <string>Assist</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Assist listens to your meeting so it can transcribe the conversation and suggest answers. Audio is transcribed on-device and never saved.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Assist transcribes your meeting on-device so it can suggest answers.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Assist listens to other meeting participants through your Mac's audio so it can transcribe what they say.</string>
+</dict>
+</plist>
