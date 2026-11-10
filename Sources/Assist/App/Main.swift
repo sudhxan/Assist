@@ -38,8 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerHotKeys()
 
         if options.demo { model.loadDemo() }
-        if let state = options.state { model.state = state; model.isPinned = state == .expanded }
-        if let tab = options.settingsTab { model.expand(pinned: true); model.openSettings(tab) }
+        if let state = options.state { model.state = state; model.holdsOpen = state == .expanded }
+        if let tab = options.settingsTab { model.expand(holdOpen: true); model.openSettings(tab) }
         if let path = options.snapshotPath {
             // Give the on-device model time to load so its status shows, then render and quit.
             DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in

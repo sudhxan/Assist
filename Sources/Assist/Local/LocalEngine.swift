@@ -22,6 +22,31 @@ struct LocalPrompt: Sendable {
     var tail: String
 }
 
+/// How many tokens an on-device answer may use.
+struct LocalBudget: Sendable {
+    /// Visible answer tokens.
+    var answer: Int
+    /// Reasoning tokens before the answer (Qwen's thinking mode); 0 answers straight away.
+    var thinking = 0
+
+    /// Live replies answer straight away. A problem to solve (`deep`) reasons first: on
+    /// coding questions that is the difference between a fragment and a working solution.
+    static func `for`(_ kind: CardKind, deep: Bool, length: AnswerLength = .standard) -> LocalBudget {
+        if deep { return LocalBudget(answer: length == .detailed ? 4_000 : 3_000, thinking: 6_000) }
+        switch length {
+        case .quick: return LocalBudget(answer: 400)
+        case .detailed: return LocalBudget(answer: 4_000)
+        case .standard: break
+        }
+        switch kind {
+        case .answer, .chat: return LocalBudget(answer: 1_500)
+        case .screen: return LocalBudget(answer: 3_000)
+        case .recap: return LocalBudget(answer: 900)
+        case .followUps, .explain: return LocalBudget(answer: 700)
+        }
+    }
+}
+
 struct LocalStats: Sendable {
     /// Time the request waited for the engine (another answer was still generating).
     var queuedSeconds = 0.0
@@ -31,12 +56,18 @@ struct LocalStats: Sendable {
     var prefillTokens = 0
     var carriedTokens = 0
     var generatedTokens = 0
+    /// Reasoning before the answer (thinking mode).
+    var thinkingTokens = 0
+    var thinkingSeconds = 0.0
+    /// Time to the first word of the answer itself.
     var firstTokenSeconds = 0.0
     var tokensPerSecond = 0.0
     var draftAcceptance: Double?
 
     var summary: String {
-        var parts = [String(format: "%.0f ms to first word", firstTokenSeconds * 1000)]
+        var parts: [String] = []
+        if thinkingTokens > 0 { parts.append(String(format: "thought %.1f s", thinkingSeconds)) }
+        parts.append(String(format: "%.0f ms to first word", firstTokenSeconds * 1000))
         if tokensPerSecond > 0 { parts.append(String(format: "%.0f tok/s", tokensPerSecond)) }
         if carriedTokens > 0 { parts.append("\(carriedTokens) tokens pre-written") }
         return parts.joined(separator: " · ")
@@ -47,6 +78,8 @@ enum LocalEvent: Sendable {
     /// The whole answer so far, replacing what was shown (a verified draft).
     case replace(String)
     case delta(String)
+    /// Reasoning in progress: tokens thought so far. Nothing is shown until the answer starts.
+    case thinking(Int)
     case finished(LocalStats)
 }
 
@@ -111,6 +144,8 @@ actor LocalEngine {
     private var context: ModelContext?
     private var drafter: (any MTPDrafterModel)?
     private var stopTokens: Set<Int> = []
+    /// `</think>`, which ends the reasoning in thinking mode; nil if the model has none.
+    private var thinkEnd: Int?
     private var warm: Warm?
     /// A replacement warm cache being built in the background while `warm` keeps serving.
     private var building: Warm?
@@ -161,6 +196,7 @@ actor LocalEngine {
         self.context = context
         self.drafter = drafter
         self.stopTokens = stops
+        self.thinkEnd = context.tokenizer.convertTokenToId("</think>")
         self.loadedID = spec.id
         warmUp()
     }
@@ -188,6 +224,7 @@ actor LocalEngine {
     func unload() {
         context = nil
         drafter = nil
+        thinkEnd = nil
         warm = nil
         building = nil
         lineTokens.removeAll()
@@ -201,7 +238,7 @@ actor LocalEngine {
     /// answer doesn't pay for it.
     private func warmUp() {
         let prompt = LocalPrompt(system: "You are a helpful assistant.", settled: [], tail: "Say OK.")
-        _ = try? generate(prompt, id: UUID(), continuing: nil, maxTokens: 4) { _ in }
+        _ = try? generate(prompt, id: UUID(), continuing: nil, budget: LocalBudget(answer: 4)) { _ in }
         warm = nil
     }
 
@@ -303,78 +340,125 @@ actor LocalEngine {
 
     /// Streams an answer. With `continuing`, an earlier draft for a slightly different prompt
     /// is verified first and its agreeing prefix is reused instead of regenerated.
+    ///
+    /// With `budget.thinking > 0` the model reasons before answering (Qwen's thinking mode) and
+    /// only the answer is streamed. Reasoning that runs past the budget, or loops, is closed by
+    /// appending Qwen's own early-stop sentence and `</think>`, so the answer comes from the
+    /// reasoning so far (the thinking-budget recipe from Qwen's model card).
     @discardableResult
-    func generate(_ prompt: LocalPrompt, id: UUID, continuing draftID: UUID?, maxTokens: Int,
+    func generate(_ prompt: LocalPrompt, id: UUID, continuing draftID: UUID?, budget: LocalBudget,
                   requestedAt: Date = Date(), onEvent: @Sendable (LocalEvent) -> Void) throws -> [Int] {
         defer { signals.forget(id) }
         guard let context else { throw LocalEngineError.notLoaded }
         guard !signals.isCancelled(id) else { return [] }
         let start = Date()
+        let thinks = budget.thinking > 0 && thinkEnd != nil
 
         // Usually a no-op: the background sync has already prefilled every settled line.
         sync(system: prompt.system, settled: prompt.settled, background: false)
         guard let warm else { throw LocalEngineError.notLoaded }
         var stats = LocalStats(queuedSeconds: start.timeIntervalSince(requestedAt),
                                syncSeconds: Date().timeIntervalSince(start), reusedTokens: warm.tokenCount)
-        let input = encode(ChatML.close(tail: prompt.tail))
+        let input = encode(ChatML.close(tail: prompt.tail, thinking: thinks))
         stats.prefillTokens = input.count
+        guard let last = input.last else { throw LocalEngineError.notLoaded }
 
-        // With a draft to continue, the prompt (minus its last token) is prefilled once and
-        // shared: verification scores the draft on a copy, and generation resumes from it.
-        let cache: [KVCache]
-        var feed = input
+        // The prompt minus its last token is prefilled once into `base`, which is never
+        // modified: verification scores a draft on a copy, generation runs on a copy, and an
+        // over-budget answer restarts from a copy without prefilling the prompt again.
+        let base = warm.cache.map { $0.copy() }
+        prefill(Array(input.dropLast()), into: base)
         var carried: [Int] = []
-        if let draftID, let draft = outputs[draftID], !draft.isEmpty, let last = input.last {
-            let base = warm.cache.map { $0.copy() }
-            prefill(Array(input.dropLast()), into: base)
+        if !thinks, let draftID, let draft = outputs[draftID], !draft.isEmpty {
             carried = verify(draft, after: last, on: base)
             onEvent(.replace(context.tokenizer.decode(tokenIds: carried)))
             stats.carriedTokens = carried.count
-            cache = base
-            feed = [last] + carried
-        } else {
-            cache = warm.cache.map { $0.copy() }
         }
 
-        let parameters = GenerateParameters(maxTokens: max(1, maxTokens - carried.count), temperature: 0)
-        let lmInput = LMInput(tokens: MLXArray(feed.map(Int32.init)))
-        var iterator: any TokenIteratorProtocol
-        if let drafter, mtpEnabled {
-            iterator = try MTPSpeculativeTokenIterator(
-                input: lmInput, mainModel: context.model, drafter: drafter, mainCache: cache,
-                parameters: parameters, blockSize: mtpBlockSize)
-        } else {
-            iterator = try TokenIterator(input: lmInput, model: context.model, cache: cache, parameters: parameters)
-        }
-
-        var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
-        for token in carried { detokenizer.append(token: token) }
-        _ = detokenizer.next()
-
-        var generated = carried
+        var answer = AnswerStream(tokenizer: context.tokenizer, carried: carried)
+        var thought: [Int] = []
+        var thinking = thinks
+        var closeEarly = false
         var firstToken: Date?
+        var decoded = 0
+
+        let parameters = GenerateParameters(maxTokens: budget.answer + (thinks ? budget.thinking : 0), temperature: 0)
+        var iterator = try iterator(feed: [last] + carried, cache: base.map { $0.copy() }, parameters: parameters)
         while let token = iterator.next() {
-            if signals.isCancelled(id) || stopTokens.contains(token) { break }
+            if signals.isCancelled(id) { break }
+            if stopTokens.contains(token) {
+                // Ending the turn mid-reasoning would leave no answer: make it answer instead.
+                closeEarly = thinking && !thought.isEmpty
+                break
+            }
             if firstToken == nil { firstToken = Date() }
-            generated.append(token)
-            detokenizer.append(token: token)
-            if let text = detokenizer.next(), !text.isEmpty { onEvent(.delta(text)) }
-            if generated.count >= maxTokens { break }
+            decoded += 1
+            if thinking {
+                if token == thinkEnd {
+                    thinking = false
+                    stats.thinkingSeconds = Date().timeIntervalSince(start)
+                    continue
+                }
+                thought.append(token)
+                if thought.count % 16 == 0 {
+                    onEvent(.thinking(thought.count))
+                    if Self.isLooping(thought) { closeEarly = true; break }
+                }
+                if thought.count >= budget.thinking { closeEarly = true; break }
+                continue
+            }
+            if let text = answer.add(token) { onEvent(.delta(text)) }
+            if answer.tokens.count >= budget.answer { break }
+        }
+
+        if closeEarly, !signals.isCancelled(id) {
+            stats.thinkingSeconds = Date().timeIntervalSince(start)
+            let closing = encode(ChatML.closeThinkingEarly)
+            iterator = try self.iterator(feed: [last] + thought + closing, cache: base.map { $0.copy() },
+                                         parameters: GenerateParameters(maxTokens: budget.answer, temperature: 0))
+            while let token = iterator.next() {
+                if signals.isCancelled(id) || stopTokens.contains(token) { break }
+                decoded += 1
+                if let text = answer.add(token) { onEvent(.delta(text)) }
+                if answer.tokens.count >= budget.answer { break }
+            }
         }
 
         let end = Date()
-        let fresh = generated.count - carried.count
-        stats.generatedTokens = fresh
-        stats.firstTokenSeconds = (firstToken ?? end).timeIntervalSince(start)
-        if let firstToken, fresh > 1 {
-            stats.tokensPerSecond = Double(fresh - 1) / max(end.timeIntervalSince(firstToken), 1e-3)
+        stats.thinkingTokens = thought.count
+        stats.generatedTokens = answer.tokens.count - carried.count
+        stats.firstTokenSeconds = (answer.firstVisible ?? end).timeIntervalSince(start)
+        if let firstToken, decoded > 1 {
+            stats.tokensPerSecond = Double(decoded - 1) / max(end.timeIntervalSince(firstToken), 1e-3)
         }
         if let mtp = iterator as? MTPSpeculativeTokenIterator, mtp.proposedCount > 0 {
             stats.draftAcceptance = Double(mtp.acceptedCount) / Double(mtp.proposedCount)
         }
-        remember(generated, for: id)
+        remember(answer.tokens, for: id)
         onEvent(.finished(stats))
-        return generated
+        return answer.tokens
+    }
+
+    private func iterator(feed: [Int], cache: [KVCache], parameters: GenerateParameters) throws -> any TokenIteratorProtocol {
+        guard let context else { throw LocalEngineError.notLoaded }
+        let input = LMInput(tokens: MLXArray(feed.map(Int32.init)))
+        if let drafter, mtpEnabled {
+            return try MTPSpeculativeTokenIterator(input: input, mainModel: context.model, drafter: drafter, mainCache: cache,
+                                                   parameters: parameters, blockSize: mtpBlockSize)
+        }
+        return try TokenIterator(input: input, model: context.model, cache: cache, parameters: parameters)
+    }
+
+    /// Greedy reasoning can fall into a loop, repeating the same passage. Three back-to-back
+    /// copies of a stretch of at least 24 tokens is a loop, not a careful re-check.
+    static func isLooping(_ tokens: [Int]) -> Bool {
+        let n = tokens.count
+        guard n >= 72 else { return false }
+        for period in 24...min(400, n / 3) {
+            let a = n - period, b = a - period, c = b - period
+            if tokens[a..<n].elementsEqual(tokens[b..<a]), tokens[b..<a].elementsEqual(tokens[c..<b]) { return true }
+        }
+        return false
     }
 
     /// PredGen greedy verification: score the old draft under the new prompt and keep the
@@ -492,7 +576,41 @@ enum ChatML {
         "<|im_start|>system\n\(system)<|im_end|>\n<|im_start|>user\n"
     }
 
-    static func close(tail: String) -> String {
-        "\(tail)<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    /// Closes the user turn and opens the answer. Without `thinking` the reasoning block is
+    /// left empty, so the answer starts on the first token.
+    static func close(tail: String, thinking: Bool = false) -> String {
+        "\(tail)<|im_end|>\n<|im_start|>assistant\n<think>\n" + (thinking ? "" : "\n</think>\n\n")
+    }
+
+    /// Ends reasoning that ran out of budget (the wording from Qwen's thinking-budget recipe).
+    static let closeThinkingEarly = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n\n"
+}
+
+/// Detokenizes the visible answer, holding back leading blank lines so the card starts on text.
+private struct AnswerStream {
+    private var detokenizer: NaiveStreamingDetokenizer
+    private(set) var tokens: [Int]
+    private(set) var firstVisible: Date?
+    private var started: Bool
+
+    init(tokenizer: any MLXLMCommon.Tokenizer, carried: [Int]) {
+        detokenizer = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        tokens = carried
+        for token in carried { detokenizer.append(token: token) }
+        _ = detokenizer.next()
+        started = !carried.isEmpty
+    }
+
+    mutating func add(_ token: Int) -> String? {
+        tokens.append(token)
+        detokenizer.append(token: token)
+        guard var text = detokenizer.next(), !text.isEmpty else { return nil }
+        if !started {
+            text = String(text.drop(while: \.isNewline))
+            guard !text.isEmpty else { return nil }
+            started = true
+        }
+        if firstVisible == nil { firstVisible = Date() }
+        return text
     }
 }

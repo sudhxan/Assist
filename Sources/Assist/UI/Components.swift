@@ -166,11 +166,15 @@ struct MarkdownText: View {
                 case .paragraph(let line):
                     Text(MarkdownLite.inline(line))
                 case .code(let code):
-                    Text(code)
-                        .font(.system(size: 11.5, design: .monospaced))
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.white.opacity(0.07)))
+                    // Scrolls sideways instead of wrapping, so indentation stays readable.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        Text(code)
+                            .font(.system(size: 11.5, design: .monospaced))
+                            .fixedSize()
+                            .padding(8)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(.white.opacity(0.07)))
                 }
             }
         }

@@ -10,10 +10,15 @@ enum Bench {
         let llm = arguments.contains { $0 == "--bench" || $0.hasPrefix("--bench=") }
         let stt = arguments.contains("--bench-stt")
         let e2e = arguments.contains("--bench-e2e")
+        let screen = arguments.contains { $0.hasPrefix("--bench-screen=") }
         print("Assist bench · \(ProcessInfo.processInfo.physicalMemory >> 30) GB · \(Host.current().localizedName ?? "")")
         if llm { await runLLM(arguments) }
         if stt { await STTBench.run() }
         if e2e { await E2EBench.run() }
+        if arguments.contains("--bench-logic") { await LogicBench.run() }
+        if arguments.contains("--bench-mic") { await MicBench.run() }
+        if arguments.contains("--bench-echo") { await EchoBench.run() }
+        if screen { await ScreenBench.run(arguments) }
     }
 
     private static func runLLM(_ arguments: [String]) async {
@@ -88,10 +93,10 @@ enum Bench {
             let draftID = UUID()
             let draft = EventLog()
             _ = try await engine.generate(LocalPrompt(system: system, settled: settled, tail: draftTail),
-                                          id: draftID, continuing: nil, maxTokens: 160) { draft.record($0) }
+                                          id: draftID, continuing: nil, budget: LocalBudget(answer: 160)) { draft.record($0) }
             let resumed = EventLog()
             _ = try await engine.generate(LocalPrompt(system: system, settled: settled, tail: finalTail),
-                                          id: UUID(), continuing: draftID, maxTokens: 220) { resumed.record($0) }
+                                          id: UUID(), continuing: draftID, budget: LocalBudget(answer: 220)) { resumed.record($0) }
             print(String(format: "PredGen · %@: kept %d/%d chars of the draft, shown after %.0f ms; next new word at %.0f ms",
                          name, resumed.replaced.count, draft.text.count, resumed.replacedAfter * 1000,
                          resumed.stats.firstTokenSeconds * 1000))
@@ -112,7 +117,7 @@ enum Bench {
 
     private static func answer(_ engine: LocalEngine, _ prompt: LocalPrompt, label: String) async throws -> LocalStats {
         let log = EventLog()
-        _ = try await engine.generate(prompt, id: UUID(), continuing: nil, maxTokens: 220) { log.record($0) }
+        _ = try await engine.generate(prompt, id: UUID(), continuing: nil, budget: LocalBudget(answer: 220)) { log.record($0) }
         let stats = log.stats
         let acceptance = stats.draftAcceptance.map { String(format: " · MTP acceptance %.0f%%", $0 * 100) } ?? ""
         print(String(format: "%@: first word %.0f ms · prefill %d tok (reused %d) · %.1f tok/s · %d tokens%@",
@@ -145,6 +150,7 @@ private final class EventLog: @unchecked Sendable {
                 _text = all
                 _replaced = all
                 _replacedAfter = Date().timeIntervalSince(start)
+            case .thinking: break
             case .finished(let stats): _stats = stats
             }
         }

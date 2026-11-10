@@ -30,7 +30,12 @@ final class AppModel {
     /// Cursor is over the closed notch: the buddy stirs before the panel opens.
     var isHoveringNotch = false
     var sleepPhase = SleepPhase.asleep
+    /// Pinned with the pin button or ⌘\: stays open when the cursor leaves and when you click
+    /// into another app, until you unpin it, press Esc or ⌘\.
     var isPinned = false
+    /// Softer than a pin: you clicked into the panel, or it opened to show you something. Moving
+    /// the cursor away won't close it, but a click somewhere else will.
+    var holdsOpen = false
     var showingSettings = false
     var settingsTab = SettingsTab.context
     var focusInputRequest = 0
@@ -87,6 +92,8 @@ final class AppModel {
     var meetingContext = "" { didSet { defaults.set(meetingContext, forKey: Key.context) } }
     var autoAnswer = true { didSet { defaults.set(autoAnswer, forKey: Key.autoAnswer) } }
     var captureSystemAudio = true { didSet { defaults.set(captureSystemAudio, forKey: Key.systemAudio) } }
+    /// Removes the call's audio from your mic, so speakers don't put their words in your mouth.
+    var echoCancellation = true { didSet { defaults.set(echoCancellation, forKey: Key.echoCancellation) } }
     var localeID = "en-US" { didSet { defaults.set(localeID, forKey: Key.locale) } }
     var hideFromScreenShare = true {
         didSet {
@@ -110,6 +117,8 @@ final class AppModel {
     @ObservationIgnored weak var window: NotchWindowBridge?
     /// Reports harness decisions (draft started, kept, verified, …); used by the end-to-end bench.
     @ObservationIgnored var trace: ((String) -> Void)?
+    /// Receives the request an answer would send instead of sending it; used by `--bench-logic`.
+    @ObservationIgnored var requestProbe: ((String, LLMRequest) -> Void)?
     /// Per-card timing breakdown from the on-device engine, for the bench.
     @ObservationIgnored var statsDetail: [UUID: String] = [:]
     @ObservationIgnored let audio = AudioController()
@@ -137,6 +146,10 @@ final class AppModel {
     @ObservationIgnored private var volatileStart: [Speaker: Date] = [:]
     @ObservationIgnored private var appendedCount = 0
     @ObservationIgnored private var suggestions: [SuggestionNote] = []
+    /// Questions from transcript lines that have been trimmed away; the memory keeps them.
+    @ObservationIgnored private var earlierExchanges: [Exchange] = []
+    /// Lines the model judged to be waiting on you although they aren't phrased as questions.
+    @ObservationIgnored private var replyExpected: Set<UUID> = []
 
     /// An answer Assist gave, threaded into the on-device model's transcript at the point it
     /// appeared. It's prefilled with the transcript in the background instead of being re-sent
@@ -167,6 +180,7 @@ final class AppModel {
         static let profile = "profile", prerequisites = "prerequisites", notes = "notes", context = "meetingContext"
         static let autoAnswer = "autoAnswer", systemAudio = "captureSystemAudio", hide = "hideFromScreenShare"
         static let locale = "locale", localModel = "localModel", speech = "speechEngine"
+        static let echoCancellation = "echoCancellation"
         static func hasKey(_ provider: AIProvider) -> String {
             provider == .claude ? "hasStoredAPIKey" : "hasStoredAPIKey.\(provider.rawValue)"
         }
@@ -179,6 +193,7 @@ final class AppModel {
             Key.autoAnswer: true,
             Key.systemAudio: true,
             Key.hide: true,
+            Key.echoCancellation: true,
             Key.locale: Locale.current.identifier,
         ])
         provider = AIProvider(rawValue: defaults.string(forKey: Key.provider) ?? "") ?? .claude
@@ -191,6 +206,7 @@ final class AppModel {
         meetingContext = defaults.string(forKey: Key.context) ?? ""
         autoAnswer = defaults.bool(forKey: Key.autoAnswer)
         captureSystemAudio = defaults.bool(forKey: Key.systemAudio)
+        echoCancellation = defaults.bool(forKey: Key.echoCancellation)
         hideFromScreenShare = defaults.bool(forKey: Key.hide)
         localeID = defaults.string(forKey: Key.locale) ?? "en-US"
         localModelID = LocalModelSpec.named(defaults.string(forKey: Key.localModel) ?? "").id
@@ -258,15 +274,16 @@ final class AppModel {
         showingSettings = true
     }
 
-    func expand(pinned: Bool) {
+    func expand(holdOpen: Bool) {
         peekTask?.cancel()
         state = .expanded
-        if pinned { isPinned = true }
+        if holdOpen { holdsOpen = true }
     }
 
     func collapse() {
         state = .collapsed
         isPinned = false
+        holdsOpen = false
         window?.releaseKeyFocus()
     }
 
@@ -351,9 +368,11 @@ final class AppModel {
         let locale = Locale(identifier: localeID)
         let includeSystem = captureSystemAudio
         let engine = speechEngine
+        let cancelEcho = echoCancellation
         Task {
             do {
-                let result = try await audio.startMeeting(locale: locale, includeSystemAudio: includeSystem, engine: engine)
+                let result = try await audio.startMeeting(locale: locale, includeSystemAudio: includeSystem, engine: engine,
+                                                          echoCancellation: cancelEcho)
                 isListening = true
                 wakeUp()
                 systemAudioActive = result.systemAudio
@@ -368,7 +387,7 @@ final class AppModel {
                 startSettling()
             } catch {
                 notice = Notice(error)
-                expand(pinned: true)
+                expand(holdOpen: true)
             }
             isStarting = false
             startupStatus = nil
@@ -393,6 +412,8 @@ final class AppModel {
     func clearTranscript() {
         discardDraft()
         suggestions.removeAll()
+        earlierExchanges.removeAll()
+        replyExpected.removeAll()
         lines.removeAll()
         volatile.removeAll()
         volatileStart.removeAll()
@@ -437,25 +458,29 @@ final class AppModel {
     private func handleTranscript(_ speaker: Speaker, _ update: LiveTranscriber.Update) {
         switch update {
         case .volatile(let raw):
-            let text = raw.trimmed
+            var text = raw.trimmed
+            // Their words coming back through your mic are not you talking.
+            if speaker == .me { text = withoutEcho(text) }
             if volatile[speaker] == nil, !text.isEmpty { volatileStart[speaker] = Date() }
+            if text.isEmpty { volatileStart[speaker] = nil }
             volatile[speaker] = text.isEmpty ? nil : text
             transcriptRevision += 1
             if questionSpeakers.contains(speaker), !text.isEmpty { invalidateDraft(for: text) }
         case .pause(let raw):
-            let text = raw.trimmed
+            var text = raw.trimmed
+            if speaker == .me { text = withoutEcho(text) }
             guard !text.isEmpty else { return }
-            if speaker == .me, isEcho(text) { return }
             volatile[speaker] = text
             anticipate(speaker, text: text)
         case .final(let raw):
             let start = volatileStart[speaker]
             volatile[speaker] = nil
             volatileStart[speaker] = nil
-            let text = raw.trimmed
+            var text = raw.trimmed
             transcriptRevision += 1
+            // Take their words out of what the mic heard, and keep whatever you said yourself.
+            if speaker == .me { text = withoutEcho(text) }
             guard !text.isEmpty else { return }
-            if speaker == .me, isEcho(text) { return }
             if speaker == .them { dropEchoedMicLines(matching: text) }
             appendFinal(speaker, text, start: start)
             if questionSpeakers.contains(speaker), let question = currentQuestion(), resolveDraft(question: question) {
@@ -494,18 +519,64 @@ final class AppModel {
         } else {
             // Stamp the line when the speaker started, not when recognition finished.
             appendedCount += 1
-            lines.append(TranscriptLine(speaker: speaker, text: text, start: min(start ?? now, now), updated: now, seq: appendedCount))
+            let began = min(start ?? now, now)
+            // The two channels finish independently, so a long turn can be recognized after a
+            // short one that began later. Keep the transcript in the order things were said,
+            // moving only past lines that are still unsettled (the model hasn't read them yet).
+            var index = lines.count
+            let pinned = suggestions.last?.afterSeq ?? 0
+            while index > 0 {
+                let previous = lines[index - 1]
+                guard previous.speaker != speaker, previous.start > began, previous.seq > pinned,
+                      now.timeIntervalSince(previous.updated) < Self.settleAfter else { break }
+                index -= 1
+            }
+            lines.insert(TranscriptLine(speaker: speaker, text: text, start: began, updated: now, seq: appendedCount), at: index)
         }
-        if lines.count > 500 { lines.removeFirst(lines.count - 500) }
+        if lines.count > 500 {
+            // The transcript forgets its oldest lines; the conversation memory keeps what was asked.
+            let dropped = Array(lines.prefix(lines.count - 500))
+            earlierExchanges = Array(ConversationState.build(dropped.map(Self.utterance), earlier: earlierExchanges,
+                                                             expectsReply: replyExpected).exchanges.suffix(200))
+            replyExpected.subtract(dropped.map(\.id))
+            lines.removeFirst(dropped.count)
+        }
+    }
+
+    private static func utterance(_ line: TranscriptLine) -> Utterance {
+        Utterance(id: line.id, speaker: line.speaker, text: line.text, start: line.start, updated: line.updated)
+    }
+
+    /// What has been asked and answered so far, and who is waiting on whom. Words the other
+    /// side is still speaking count; yours don't until they're final (they may be echo).
+    func conversationState() -> ConversationState {
+        var utterances = lines.map(Self.utterance)
+        let now = Date()
+        for speaker in [Speaker.them, .room] {
+            guard let text = volatile[speaker], !text.isEmpty else { continue }
+            utterances.append(Utterance(id: nil, speaker: speaker, text: text, start: volatileStart[speaker] ?? now, updated: now))
+        }
+        return ConversationState.build(utterances, earlier: earlierExchanges, expectsReply: replyExpected)
     }
 
     /// With speakers (no headphones) the mic also hears the other side; skip those copies.
+    /// What you said, minus any of the other side's words the mic picked up from the speakers.
+    private func withoutEcho(_ text: String) -> String {
+        guard systemAudioActive, !text.isEmpty else { return text }
+        return EchoFilter.withoutEcho(text, of: recentFromThem(now: Date()))
+    }
+
     private func isEcho(_ text: String) -> Bool {
         guard systemAudioActive else { return false }
         let now = Date()
+        return EchoFilter.isEcho(text, of: recentFromThem(now: now))
+    }
+
+    /// What the other side said in the last few seconds, oldest first, including words in flight.
+    private func recentFromThem(now: Date) -> [String] {
         var recent = lines.suffix(8).filter { $0.speaker == .them && now.timeIntervalSince($0.updated) < 12 }.map(\.text)
         if let v = volatile[.them] { recent.append(v) }
-        return recent.contains { EchoFilter.overlap(text, $0) >= 0.6 }
+        return recent
     }
 
     /// Your lines can be dropped as echoes this long after they're written, so they only
@@ -515,7 +586,14 @@ final class AppModel {
 
     private func dropEchoedMicLines(matching text: String) {
         let now = Date()
-        lines.removeAll { $0.speaker == .me && now.timeIntervalSince($0.updated) < Self.echoWindow && EchoFilter.overlap($0.text, text) >= 0.6 }
+        // The mic cuts utterances at different points than the call audio does, so compare
+        // against everything they said recently, not just this one line.
+        let reference = recentFromThem(now: now) + [text]
+        for index in lines.indices.reversed() where lines[index].speaker == .me && now.timeIntervalSince(lines[index].updated) < Self.echoWindow {
+            // Only their words go; a line that also holds something you said keeps that part.
+            let mine = EchoFilter.withoutEcho(lines[index].text, of: reference)
+            if mine.isEmpty { lines.remove(at: index) } else if mine != lines[index].text { lines[index].text = mine }
+        }
     }
 
     // MARK: Auto answer
@@ -532,7 +610,10 @@ final class AppModel {
             // about…"). Let the model decide.
             Task { [weak self] in
                 guard let p = await self?.turnCheck(), p >= Self.replyThreshold, let self,
-                      self.lines.last?.text.hasSuffix(text) == true, !self.pendingQuestion else { return }
+                      let line = self.lines.last, line.speaker == speaker, line.text.hasSuffix(text),
+                      !self.pendingQuestion else { return }
+                // Remember it as something asked of you, though it wasn't phrased as a question.
+                self.replyExpected.insert(line.id)
                 self.pendingSince = Date()
                 self.pendingQuestion = true
                 self.scheduleAutoAnswer()
@@ -576,30 +657,10 @@ final class AppModel {
         }
     }
 
-    /// The other side's most recent turn (up to three lines), including anything still being spoken.
+    /// The other side's current turn, including anything still being spoken, when they are
+    /// the ones waiting. Nil once you've started replying.
     private func currentQuestion() -> String? {
-        var parts: [String] = []
-        // Words still being spoken are the newest part of the turn.
-        var boundary: Date?
-        for speaker in questionSpeakers {
-            if let v = volatile[speaker], !v.isEmpty {
-                parts.append(v)
-                boundary = volatileStart[speaker] ?? Date()
-            }
-        }
-        // Then their latest lines, back to your last line, as long as they run together
-        // (a statement from a minute ago isn't part of this question).
-        for line in lines.reversed() {
-            if line.speaker == .me {
-                if parts.isEmpty { continue } else { break }
-            }
-            if let boundary, boundary.timeIntervalSince(line.updated) > 8 { break }
-            parts.insert(line.text, at: 0)
-            boundary = line.start
-            if parts.count >= 3 { break }
-        }
-        let question = parts.joined(separator: " ").trimmed
-        return question.isEmpty ? nil : String(question.suffix(700))
+        conversationState().openTurn
     }
 
     // MARK: Asking the model
@@ -621,26 +682,61 @@ final class AppModel {
         selectedCardID = cards[next].id
     }
 
+    /// Answers whatever the conversation is waiting on right now: their open question, the
+    /// answer you're halfway through, or simply what to say next.
     func answerNow(auto: Bool = false) {
-        let question = currentQuestion()
+        let state = conversationState()
         if auto {
-            guard let question, question != lastAutoQuestion else { return }
+            guard !solvingOnDevice else { return }
+            guard let question = state.openTurn, question != lastAutoQuestion else { return }
             lastAutoQuestion = question
         }
-        if question == nil && lines.isEmpty {
-            if !inputText.trimmed.isEmpty { sendChat(); return }
-            notice = Notice(text: "Nothing heard yet. Press ⌘⇧L to start listening, or type a question below.", isError: false)
-            expand(pinned: true)
-            return
+        switch state.focus {
+        case .theirTurn(let text, _):
+            // On-device, the question is already the transcript's last turn; a fixed task keeps
+            // the prompt identical to the one a speculative draft would have used.
+            ask(kind: .answer, title: text, task: provider.isLocal ? localAnswerTask(state) : Prompts.answerTask(question: text),
+                lineID: questionLineID())
+        case .myTurn(let said, let index):
+            // You've already started replying: help finish that answer rather than re-answering
+            // an older question as if nothing had been said.
+            let question = index.map { state.exchanges[$0].question }
+            ask(kind: .answer, title: question ?? "What should I say next?", task: Prompts.continueTask(question: question, said: said))
+        case .none:
+            if lines.isEmpty {
+                if !inputText.trimmed.isEmpty { sendChat(); return }
+                notice = Notice(text: "Nothing heard yet. Press ⌘⇧L to start listening, or type a question below.", isError: false)
+                expand(holdOpen: true)
+                return
+            }
+            ask(kind: .answer, title: "What should I say next?", task: Prompts.answerTask(question: nil))
         }
-        // On-device, the question is already the transcript's last turn; a fixed task keeps the
-        // prompt identical to the one a speculative draft would have used.
-        let task = provider.isLocal && question != nil ? Prompts.localAnswerTask : Prompts.answerTask(question: question)
-        ask(kind: .answer, title: question ?? "What should I say next?", task: task)
     }
 
-    func answer(line: TranscriptLine) {
-        ask(kind: .answer, title: line.text, task: Prompts.answerTask(question: line.text))
+    /// One of a line's Quick / Explain / Elaborate options. An answer already written for it
+    /// at that length is shown again rather than generated twice.
+    func answer(line: TranscriptLine, length: AnswerLength = .standard) {
+        if let card = card(for: line, length: length), !card.failed {
+            selectedCardID = card.id
+            return
+        }
+        ask(kind: .answer, title: line.text, task: Prompts.answerTask(question: line.text, length: length),
+            length: length, lineID: line.id)
+    }
+
+    /// The newest answer to this line at this length, if there is one.
+    func card(for line: TranscriptLine, length: AnswerLength) -> AnswerCard? {
+        cards.last { $0.kind == .answer && $0.lineID == line.id && $0.length == length }
+    }
+
+    /// Whether this line asks me something, so its answer options stay on show.
+    func asksMe(_ line: TranscriptLine) -> Bool {
+        questionSpeakers.contains(line.speaker) && (QuestionDetector.isQuestion(line.text) || replyExpected.contains(line.id))
+    }
+
+    /// The line an automatic answer to their current turn belongs to.
+    private func questionLineID() -> UUID? {
+        lines.last { questionSpeakers.contains($0.speaker) }?.id
     }
 
     func run(_ kind: CardKind) {
@@ -658,37 +754,60 @@ final class AppModel {
         let text = inputText.trimmed
         guard !text.isEmpty else { return }
         inputText = ""
-        ask(kind: .chat, title: text, task: Prompts.chatTask(text))
+        ask(kind: .chat, title: text, task: Prompts.chatTask(text), deep: Prompts.looksLikeProblem(text),
+            length: Prompts.wantsDetail(text) ? .detailed : .standard)
     }
 
+    /// Reads the screen and solves what's on it. Always a problem-solving request: someone who
+    /// grabs their screen mid-call is usually looking at a question, code or an error.
     func analyzeScreen() {
         guard !isCapturingScreen else { return }
         isCapturingScreen = true
         let typed = inputText.trimmed
         let displayID = Self.displayUnderMouse()
+        let provider = provider
+        let model = currentModel
         Task {
             defer { isCapturingScreen = false }
             do {
                 let title = typed.isEmpty ? "What's on my screen?" : typed
-                if provider.isLocal {
-                    let image = try await ScreenGrabber.captureImage(displayID: displayID, maxDimension: 2600)
+                // Whether this OpenRouter model reads images at all, looked up while capturing.
+                async let catalog: OpenRouterCatalog.Info? = provider == .openRouter ? await OpenRouterCatalog.shared.info(for: model) : nil
+                let image = try await ScreenGrabber.captureImage(displayID: displayID)
+                let task: String
+                var jpeg: Data?
+                switch provider {
+                case .local:
+                    task = Prompts.screenTextTask(try await ScreenText.recognize(image), typed: typed)
+                case .openRouter:
+                    // OpenRouter models range from strong vision models to text-only ones, so they
+                    // also get the screen as OCR text, and a text-only model gets only that.
+                    async let encoded = Task.detached { try ScreenGrabber.jpeg(image) }.value
                     let text = try await ScreenText.recognize(image)
-                    if !typed.isEmpty { inputText = "" }
-                    ask(kind: .screen, title: title, task: Prompts.screenTextTask(text, typed: typed))
-                    return
+                    if await catalog?.acceptsImages == false {
+                        task = Prompts.screenTextTask(text, typed: typed)
+                    } else {
+                        jpeg = try await encoded
+                        task = Prompts.screenTask(typed, ocr: text)
+                    }
+                case .claude, .gemini:
+                    // These read screenshots precisely at full resolution; OCR would only add time.
+                    jpeg = try await Task.detached { try ScreenGrabber.jpeg(image) }.value
+                    task = Prompts.screenTask(typed)
                 }
-                let jpeg = try await ScreenGrabber.capture(displayID: displayID)
                 if !typed.isEmpty { inputText = "" }
-                ask(kind: .screen, title: title, task: Prompts.screenTask(typed), image: jpeg)
+                ask(kind: .screen, title: title, task: task, image: jpeg, deep: true,
+                    length: Prompts.wantsDetail(typed) ? .detailed : .standard)
             } catch {
                 notice = Notice(error)
-                expand(pinned: true)
+                expand(holdOpen: true)
             }
         }
     }
 
     func regenerate(_ card: AnswerCard) {
-        ask(kind: card.kind, title: card.title, task: card.task, image: card.imageJPEG)
+        ask(kind: card.kind, title: card.title, task: card.task, image: card.imageJPEG, deep: card.deep,
+            length: card.length, lineID: card.lineID)
     }
 
     func copy(_ card: AnswerCard) {
@@ -696,30 +815,43 @@ final class AppModel {
         NSPasteboard.general.setString(card.text, forType: .string)
     }
 
-    private func ask(kind: CardKind, title: String, task: String, image: Data? = nil) {
+    /// `deep` marks a problem to solve: on-device it reasons before answering, in the cloud it
+    /// asks for more effort, and either way it gets room for a complete solution.
+    private func ask(kind: CardKind, title: String, task: String, image: Data? = nil, deep: Bool = false,
+                     length: AnswerLength = .standard, lineID: UUID? = nil) {
         let provider = provider
+        if let requestProbe {
+            requestProbe(title, LLMRequest(system: systemPrompt, text: cloudPrompt(task: task, excluding: nil), imageJPEG: image,
+                                           deep: deep, length: length))
+            return
+        }
         if provider.isLocal {
-            askLocal(kind: kind, title: title, task: task)
+            askLocal(kind: kind, title: title, task: task, deep: deep, length: length, lineID: lineID)
             return
         }
         guard let key = apiKey(for: provider) else {
             notice = Notice(text: "Add your \(provider.label) API key to get answers.", action: .apiKeySettings)
-            expand(pinned: true)
+            expand(holdOpen: true)
             openSettings(.ai)
             return
         }
 
         let model = currentModel
-        let id = createCard(kind: kind, title: title, task: task, image: image)
+        let id = createCard(kind: kind, title: title, task: task, image: image, deep: deep, length: length, lineID: lineID)
         let request = LLMRequest(
             system: systemPrompt,
-            text: Prompts.user(task: task, transcript: transcriptForPrompt(), recent: recentRepliesForPrompt(excluding: id)),
-            imageJPEG: image
+            text: cloudPrompt(task: task, excluding: id),
+            imageJPEG: image,
+            deep: deep,
+            length: length
         )
         tasks[id] = Task { [weak self] in
             do {
-                for try await chunk in LLMClient.stream(request, provider: provider, model: model, apiKey: key) {
-                    self?.append(chunk, to: id)
+                for try await event in LLMClient.stream(request, provider: provider, model: model, apiKey: key) {
+                    switch event {
+                    case .text(let chunk): self?.append(chunk, to: id)
+                    case .thinking: self?.setThinking("Thinking…", for: id)
+                    }
                 }
                 self?.finish(id, error: nil)
             } catch is CancellationError {
@@ -730,11 +862,22 @@ final class AppModel {
         }
     }
 
+    /// Transcript, then the conversation memory and recent replies, then the task.
+    private func cloudPrompt(task: String, excluding id: UUID?) -> String {
+        Prompts.user(task: task, transcript: transcriptForPrompt(),
+                     state: conversationState().rendered(stamp: stamp(for:)),
+                     recent: recentRepliesForPrompt(excluding: id))
+    }
+
     @discardableResult
-    private func createCard(kind: CardKind, title: String, task: String, image: Data?, id: UUID = UUID()) -> UUID {
+    private func createCard(kind: CardKind, title: String, task: String, image: Data?, deep: Bool = false,
+                            length: AnswerLength = .standard, lineID: UUID? = nil, id: UUID = UUID()) -> UUID {
         wakeUp()
         var card = AnswerCard(kind: kind, title: title, task: task, imageJPEG: image, modelLabel: currentModelLabel)
         card.id = id
+        card.deep = deep
+        card.length = length
+        card.lineID = lineID
         cards.append(card)
         if cards.count > 60 { cards.removeFirst(cards.count - 60) }
         selectedCardID = card.id
@@ -745,6 +888,11 @@ final class AppModel {
     private func append(_ chunk: String, to id: UUID) {
         guard let index = cards.firstIndex(where: { $0.id == id }) else { return }
         cards[index].text += chunk
+    }
+
+    private func setThinking(_ note: String, for id: UUID) {
+        guard let index = cards.firstIndex(where: { $0.id == id }), cards[index].thinking != note else { return }
+        cards[index].thinking = note
     }
 
     private func finish(_ id: UUID, error: Error?) {
@@ -792,7 +940,7 @@ final class AppModel {
         return out.isEmpty ? "(nothing captured yet)" : out.joined(separator: "\n")
     }
 
-    private func recentRepliesForPrompt(excluding id: UUID) -> String {
+    private func recentRepliesForPrompt(excluding id: UUID?) -> String {
         cards.filter { $0.id != id && $0.phase == .done }.suffix(3).map {
             "Q: \($0.title.prefix(300))\nA: \($0.text.prefix(1200))"
         }.joined(separator: "\n\n")
@@ -941,6 +1089,13 @@ final class AppModel {
 
     private var localReady: Bool { provider.isLocal && localState == .ready }
 
+    /// An on-device solution (a screenshot or a typed problem) is still reasoning or writing.
+    /// The GPU runs one answer at a time and a new one stops the old, so automatic answers
+    /// and drafts wait rather than throw away a minute of reasoning. Asking yourself still wins.
+    private var solvingOnDevice: Bool {
+        localJobs.keys.contains { id in cards.contains { $0.id == id && $0.deep && $0.phase == .streaming } }
+    }
+
     private var promptContext: PromptContext {
         PromptContext(profile: profile, prerequisites: prerequisites, notes: notes, meeting: meetingContext)
     }
@@ -1056,23 +1211,33 @@ final class AppModel {
         return (prompt, key)
     }
 
-    private func askLocal(kind: CardKind, title: String, task: String) {
+    /// The on-device answer task, carrying the last exchange I answered before their current
+    /// turn so a follow-up is read against what I said.
+    private func localAnswerTask(_ state: ConversationState? = nil) -> String {
+        let state = state ?? conversationState()
+        var earlier = state.exchanges[...]
+        if case .theirTurn(_, let current?) = state.focus { earlier = state.exchanges[..<current] }
+        return Prompts.localAnswerTask(after: earlier.last)
+    }
+
+    private func askLocal(kind: CardKind, title: String, task: String, deep: Bool = false,
+                          length: AnswerLength = .standard, lineID: UUID? = nil) {
         guard localReady else {
             notice = Notice(text: localState == .loading ? "The on-device model is still loading." : "Download the on-device model to get answers.",
                             action: .apiKeySettings)
-            expand(pinned: true)
+            expand(holdOpen: true)
             if localState != .loading { openSettings(.ai) }
             return
         }
-        let id = createCard(kind: kind, title: title, task: task, image: nil)
-        runLocal(localPrompt(task: task).prompt, cardID: id)
+        let id = createCard(kind: kind, title: title, task: task, image: nil, deep: deep, length: length, lineID: lineID)
+        runLocal(localPrompt(task: task).prompt, cardID: id, budget: .for(kind, deep: deep, length: length))
     }
 
     /// Runs a request on the engine. The GPU serves one request at a time, so a new answer
     /// stops any older one still writing: the conversation has moved on, and the newest
     /// question is the one being asked.
     @discardableResult
-    private func runLocal(_ prompt: LocalPrompt, cardID: UUID) -> UUID {
+    private func runLocal(_ prompt: LocalPrompt, cardID: UUID, budget: LocalBudget = .for(.answer, deep: false)) -> UUID {
         let engine = LocalEngine.shared
         let jobID = UUID()
         for (card, job) in localJobs {
@@ -1089,7 +1254,7 @@ final class AppModel {
         let requestedAt = Date()
         tasks[cardID] = Task.detached(priority: .userInitiated) { [weak self] in
             do {
-                try await engine.generate(prompt, id: jobID, continuing: nil, maxTokens: 600, requestedAt: requestedAt) { event in
+                try await engine.generate(prompt, id: jobID, continuing: nil, budget: budget, requestedAt: requestedAt) { event in
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated { self?.applyLocal(event, cardID: cardID, jobID: jobID) }
                     }
@@ -1115,6 +1280,8 @@ final class AppModel {
             cards[index].text = text
         case .delta(let chunk):
             cards[index].text += chunk
+        case .thinking(let tokens):
+            cards[index].thinking = "Thinking · \(tokens.formatted()) tokens"
         case .finished(let stats):
             localJobs[cardID] = nil
             cards[index].stats = stats.summary
@@ -1147,7 +1314,7 @@ final class AppModel {
     /// Endpoint anticipation: the moment the other side pauses on what looks like a question,
     /// start answering. If the final transcript matches, the draft simply becomes the answer.
     private func anticipate(_ speaker: Speaker, text: String) {
-        guard autoAnswer, isListening, localReady, questionSpeakers.contains(speaker) else { return }
+        guard autoAnswer, isListening, localReady, !solvingOnDevice, questionSpeakers.contains(speaker) else { return }
         guard let question = currentQuestion(), question != lastAutoQuestion else { return }
         if QuestionDetector.isQuestion(text) {
             startDraft(question)
@@ -1165,7 +1332,8 @@ final class AppModel {
 
     private func startDraft(_ question: String) {
         let cardID = draft?.cardID ?? UUID()
-        let (prompt, key) = localPrompt(task: Prompts.localAnswerTask)
+        let task = localAnswerTask()
+        let (prompt, key) = localPrompt(task: task)
         if let draft, Self.normalized(draft.key) == Self.normalized(key) { return }
         if let index = cards.firstIndex(where: { $0.id == cardID }) {
             cards[index].text = ""
@@ -1174,7 +1342,7 @@ final class AppModel {
             cards[index].stats = nil
             selectedCardID = cardID
         } else {
-            createCard(kind: .answer, title: question, task: Prompts.localAnswerTask, image: nil, id: cardID)
+            createCard(kind: .answer, title: question, task: task, image: nil, lineID: questionLineID(), id: cardID)
         }
         let jobID = runLocal(prompt, cardID: cardID)
         draft = Draft(cardID: cardID, jobID: jobID, key: key, question: question)
@@ -1202,8 +1370,10 @@ final class AppModel {
         lastAutoQuestion = question
         pendingQuestion = false
         autoAnswerTask?.cancel()
-        let (prompt, key) = localPrompt(task: Prompts.localAnswerTask)
+        let (prompt, key) = localPrompt(task: localAnswerTask())
         guard let index = cards.firstIndex(where: { $0.id == current.cardID }) else { return false }
+        // The draft started on words still being spoken; the line holding them is final now.
+        cards[index].lineID = questionLineID()
         if Self.normalized(key) == Self.normalized(current.key) {
             trace?("draft kept: final transcript matched")
             if localJobs[current.cardID] == nil { addNote(for: current.cardID) }
@@ -1311,6 +1481,6 @@ final class AppModel {
         selectedCardID = cards.last?.id
         transcriptRevision += 1
         state = .expanded
-        isPinned = true
+        holdsOpen = true
     }
 }

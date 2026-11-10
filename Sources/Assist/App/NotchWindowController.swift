@@ -100,7 +100,7 @@ final class NotchWindowController: NotchWindowBridge {
     }
 
     func focusInput() {
-        model.expand(pinned: true)
+        model.expand(holdOpen: true)
         model.showingSettings = false
         panel.makeKeyAndOrderFront(nil)
         model.focusInputRequest += 1
@@ -112,7 +112,8 @@ final class NotchWindowController: NotchWindowBridge {
         if model.state == .expanded {
             model.collapse()
         } else {
-            model.expand(pinned: true)
+            model.expand(holdOpen: true)
+            model.isPinned = true
         }
     }
 
@@ -157,12 +158,12 @@ final class NotchWindowController: NotchWindowBridge {
             if hoverSince == nil { hoverSince = now }
             // A beat longer than a twitch, so you see the buddy stir before the panel opens.
             if let since = hoverSince, now.timeIntervalSince(since) > 0.35 {
-                model.expand(pinned: false)
+                model.expand(holdOpen: false)
                 hoverSince = nil
             }
         case .expanded:
             hoverSince = nil
-            if inside || model.isPinned || model.isDictating {
+            if inside || model.isPinned || model.holdsOpen || model.isDictating {
                 outsideSince = nil
                 return
             }
@@ -177,18 +178,20 @@ final class NotchWindowController: NotchWindowBridge {
     // MARK: Event monitors
 
     private func installMonitors() {
-        // A click inside the open panel pins it, so it stays open while you read or type.
+        // A click inside the open panel holds it open while you read or type. This must not touch
+        // `isPinned`: it fires on mouse-down, before the pin button's own toggle, which would then undo it.
         if let m = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] event in
             MainActor.assumeIsolated {
-                if let self, event.window === self.panel, self.model.state == .expanded { self.model.isPinned = true }
+                if let self, event.window === self.panel, self.model.state == .expanded { self.model.holdsOpen = true }
             }
             return event
         }) { monitors.append(m) }
 
-        // A click anywhere else closes it.
+        // A click anywhere else closes it, unless it's pinned: then it stays up (still hidden from
+        // screen share) while you work in the call or another app.
         if let m = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown], handler: { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.model.state == .expanded, !self.model.isDictating else { return }
+                guard let self, self.model.state == .expanded, !self.model.isPinned, !self.model.isDictating else { return }
                 if !self.model.hitRect(in: self.screen.frame).contains(NSEvent.mouseLocation) { self.model.collapse() }
             }
         }) { monitors.append(m) }

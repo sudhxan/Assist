@@ -15,7 +15,10 @@ enum E2EBench {
          "We started with the service that had the clearest boundary and the most pain."),
         ("Okay, that makes sense.", false, nil),
         ("I'd love to hear how you ran on-call for your last team.", true, "Sure. We had a weekly rotation with a primary and a secondary."),
-        ("What would you do differently with eight years of hospital data?", true, nil),
+        ("What would you do differently with eight years of hospital data?", true,
+         "I would validate on the most recent year first, because coding practices drift."),
+        // A follow-up that only means something given the question and reply before it.
+        ("And why does that matter?", true, nil),
     ]
 
     static func run() async {

@@ -412,6 +412,9 @@ private struct GeneralSettings: View {
         HStack(alignment: .top, spacing: 12) {
             Section(title: "Listening", symbol: "ear") {
                 Toggle("Hear other people on the call", isOn: $model.captureSystemAudio)
+                Toggle("Cancel the call's echo on my mic", isOn: $model.echoCancellation)
+                    .disabled(!model.captureSystemAudio)
+                    .help("Without headphones your mic also hears the other side. This removes them from it, so their words aren't labelled as yours. Takes effect the next time you start listening.")
                 Toggle("Answer questions automatically", isOn: $model.autoAnswer)
                 Picker("Speech recognition", selection: $model.speechEngine) {
                     Text("Parakeet · most accurate").tag(SpeechEngine.parakeet)

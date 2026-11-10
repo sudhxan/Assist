@@ -224,6 +224,8 @@ private struct TranscriptRow: View {
     let line: TranscriptLine
     @State private var hovering = false
 
+    private var asks: Bool { model.asksMe(line) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 5) {
@@ -235,13 +237,21 @@ private struct TranscriptRow: View {
                     .font(.system(size: 9.5, weight: .medium).monospacedDigit())
                     .foregroundStyle(.white.opacity(0.3))
                 Spacer(minLength: 0)
-                if hovering && line.speaker != .me {
-                    Button { model.answer(line: line) } label: {
-                        Label("Answer", systemImage: "sparkles")
-                            .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                            .foregroundStyle(Palette.mint)
+                // Any other line of theirs can still be answered: compact options on hover.
+                if hovering && line.speaker != .me && !asks {
+                    HStack(spacing: 7) {
+                        ForEach(AnswerLength.allCases, id: \.self) { length in
+                            Button { model.answer(line: line, length: length) } label: {
+                                Image(systemName: length.symbol)
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .foregroundStyle(Palette.mint)
+                                    .frame(width: 14, height: 14)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(length.help)
+                        }
                     }
-                    .buttonStyle(.plain)
                 }
             }
             .frame(height: 14)
@@ -250,9 +260,67 @@ private struct TranscriptRow: View {
                 .foregroundStyle(.white.opacity(0.88))
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+            if asks {
+                AnswerOptions(line: line)
+                    .padding(.top, 3)
+            }
         }
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
+    }
+}
+
+/// Quick / Explain / Elaborate under a question: each opens that answer on the right. A
+/// length already answered is outlined, and the one on show is filled.
+private struct AnswerOptions: View {
+    @Environment(AppModel.self) private var model
+    let line: TranscriptLine
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(AnswerLength.allCases, id: \.self) { length in
+                let card = model.card(for: line, length: length)
+                LengthChip(length: length,
+                           answered: card.map { !$0.failed } ?? false,
+                           showing: card != nil && card?.id == model.selectedCard?.id,
+                           writing: card?.phase == .streaming) {
+                    model.answer(line: line, length: length)
+                }
+            }
+        }
+    }
+}
+
+private struct LengthChip: View {
+    let length: AnswerLength
+    let answered: Bool
+    let showing: Bool
+    let writing: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                if writing {
+                    ProgressView().controlSize(.mini).scaleEffect(0.7).frame(width: 9, height: 9)
+                } else {
+                    Image(systemName: length.symbol).font(.system(size: 8.5, weight: .bold))
+                }
+                Text(length.label)
+            }
+            .font(.system(size: 10, weight: .bold, design: .rounded))
+            .foregroundStyle(showing ? AnyShapeStyle(.black) : AnyShapeStyle(Palette.mint.opacity(answered || hovering ? 1 : 0.8)))
+            .padding(.horizontal, 7)
+            .frame(height: 19)
+            .background(Capsule().fill(showing ? AnyShapeStyle(Palette.mint) : AnyShapeStyle(.white.opacity(hovering ? 0.14 : 0.07))))
+            .overlay(Capsule().stroke(Palette.mint.opacity(answered && !showing ? 0.55 : 0), lineWidth: 0.75))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(length.help)
+        .animation(.easeOut(duration: 0.15), value: showing)
     }
 }
 
@@ -315,7 +383,7 @@ private struct CardView: View {
             HStack(spacing: 4) {
                 HStack(spacing: 4) {
                     Image(systemName: card.kind.symbol)
-                    Text(card.kind.label.uppercased()).tracking(1)
+                    Text((card.kind == .answer ? "\(card.kind.label) · \(card.length.label)" : card.kind.label).uppercased()).tracking(1)
                 }
                 .font(.system(size: 9.5, weight: .heavy, design: .rounded))
                 .foregroundStyle(Palette.auroraLinear)
@@ -347,7 +415,15 @@ private struct CardView: View {
                 ScrollView(showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 8) {
                         if card.text.isEmpty && card.phase == .streaming {
-                            ThinkingDots()
+                            HStack(spacing: 8) {
+                                ThinkingDots()
+                                if let thinking = card.thinking {
+                                    Text(thinking)
+                                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                                        .monospacedDigit()
+                                        .foregroundStyle(.white.opacity(0.45))
+                                }
+                            }
                         }
                         MarkdownText(text: card.text)
                         if case .failed(let message) = card.phase {

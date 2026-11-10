@@ -65,6 +65,36 @@ enum CardKind: String {
     }
 }
 
+/// How much of an answer I want. Every question from the other side offers all three; the
+/// automatic answer is `.standard`.
+enum AnswerLength: String, CaseIterable, Sendable {
+    case quick, standard, detailed
+
+    var label: String {
+        switch self {
+        case .quick: "Quick"
+        case .standard: "Explain"
+        case .detailed: "Elaborate"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .quick: "bolt.fill"
+        case .standard: "text.alignleft"
+        case .detailed: "text.book.closed.fill"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .quick: "Quick answer: a sentence or two to say right now"
+        case .standard: "Answer with a quick explanation: a few key points"
+        case .detailed: "Elaborate answer: the full, in-depth version"
+        }
+    }
+}
+
 struct AnswerCard: Identifiable, Equatable {
     enum Phase: Equatable {
         case streaming, done, failed(String)
@@ -76,13 +106,25 @@ struct AnswerCard: Identifiable, Equatable {
     /// The instruction sent to the model, kept so the card can be regenerated.
     var task: String
     var imageJPEG: Data?
+    /// A problem to solve, answered with more reasoning and room (kept for "Try again").
+    var deep = false
+    var length = AnswerLength.standard
+    /// The transcript line this answers, so its Quick / Explain / Elaborate options find it.
+    var lineID: UUID?
     var text = ""
+    /// Shown while the model reasons before its answer, e.g. "Thinking · 512 tokens".
+    var thinking: String?
     var phase: Phase = .streaming
     /// Short "provider · model" label shown under the answer.
     var modelLabel: String
     /// On-device latency, e.g. "120 ms to first word · 66 tok/s".
     var stats: String?
     var created = Date()
+
+    var failed: Bool {
+        if case .failed = phase { return true }
+        return false
+    }
 }
 
 enum SettingsTab: String, CaseIterable, Identifiable {
@@ -208,17 +250,23 @@ enum LocalModelState: Equatable {
 struct ClaudeModel: Identifiable, Hashable, Sendable {
     let id: String
     let label: String
-    /// Accepts `output_config.effort` and server-side refusal fallbacks.
-    let tunable: Bool
+    /// Accepts server-side refusal fallbacks. Every model here accepts `output_config.effort`.
+    let fallbacks: Bool
 
+    /// Opus 5.5 leads: the strongest model that still answers at conversation speed. Fable 5.2
+    /// is the most capable, for when depth matters more than the first second; Haiku 5.5 is
+    /// the quickest.
     static let all: [ClaudeModel] = [
-        ClaudeModel(id: "claude-opus-5-5", label: "Opus 5.5", tunable: true),
-        ClaudeModel(id: "claude-sonnet-5-5", label: "Sonnet 5.5", tunable: true),
-        ClaudeModel(id: "claude-haiku-4-5", label: "Haiku 4.5", tunable: false),
+        ClaudeModel(id: "claude-opus-5-5", label: "Opus 5.5", fallbacks: true),
+        ClaudeModel(id: "claude-fable-5-2", label: "Fable 5.2", fallbacks: true),
+        ClaudeModel(id: "claude-sonnet-5-5", label: "Sonnet 5.5", fallbacks: true),
+        ClaudeModel(id: "claude-haiku-5-5", label: "Haiku 5.5", fallbacks: false),
     ]
 
     static func named(_ id: String) -> ClaudeModel {
-        all.first { $0.id == id } ?? all[0]
+        // Haiku 4.5 was replaced by Haiku 5.5; keep that choice rather than resetting it.
+        let current = id == "claude-haiku-4-5" ? "claude-haiku-5-5" : id
+        return all.first { $0.id == current } ?? all[0]
     }
 }
 

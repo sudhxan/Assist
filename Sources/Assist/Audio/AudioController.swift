@@ -17,6 +17,8 @@ final class AudioController: @unchecked Sendable {
     var onSystemAudioStopped: (@Sendable (Error?) -> Void)?
 
     private let mic = MicCapture()
+    /// Whether the mic is currently running with echo cancellation.
+    var micCancelsEcho: Bool { mic.isCancellingEcho }
     private let system = SystemAudioCapture()
     private let lock = NSLock()
     private var micTranscriber: StreamingTranscriber?
@@ -33,7 +35,8 @@ final class AudioController: @unchecked Sendable {
 
     // MARK: Meeting
 
-    func startMeeting(locale: Locale, includeSystemAudio: Bool, engine requested: SpeechEngine) async throws -> StartResult {
+    func startMeeting(locale: Locale, includeSystemAudio: Bool, engine requested: SpeechEngine,
+                      echoCancellation: Bool = true) async throws -> StartResult {
         guard await Permissions.microphone() else { throw AssistError.microphoneDenied }
         onStatus?("Waking up…")
 
@@ -71,6 +74,9 @@ final class AudioController: @unchecked Sendable {
                 micTranscriber = transcriber
                 micSpeaker = speaker
             }
+            // With the call's audio captured separately, anything of it that reaches the mic
+            // is echo. In Room mode the mic is the only source, so it stays untouched.
+            mic.echoCancellation = echoCancellation && systemOK
             try useMic("meeting")
         } catch {
             await stopMeeting()

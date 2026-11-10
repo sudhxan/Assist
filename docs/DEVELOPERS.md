@@ -32,13 +32,32 @@ To see the full UI with sample data (other launch flags are listed in `Sources/A
 | Mic (AVAudioEngine) and system audio (ScreenCaptureKit) | `Sources/Assist/Audio/Capture.swift` |
 | Speech recognition: Parakeet (default, English) or Apple SpeechAnalyzer (every language) | `Sources/Assist/Audio/ParakeetTranscriber.swift`, `LiveTranscriber.swift` |
 | Transcript, turn-taking, speculative answers, echo filtering, cards | `Sources/Assist/Model/AppModel.swift` |
+| Conversation memory: every question asked, what you said back, whose turn it is | `Sources/Assist/Model/Conversation.swift` |
 | On-device engine (MLX): warm KV cache, MTP decoding, turn check | `Sources/Assist/Local/LocalEngine.swift` |
 | On-device model catalog and downloader | `Sources/Assist/Local/LocalModels.swift` |
 | Claude, OpenRouter and Gemini streaming clients, model lists, prompts | `Sources/Assist/AI/` |
 | Benchmarks | `Sources/Assist/Local/Bench.swift`, `E2EBench.swift`, `Audio/STTBench.swift` |
 | Buddy, notch shape, panel UI | `Sources/Assist/UI/` |
 
-With Claude, Assist defaults to **Opus 5.5** at low effort for fast replies, and caches the system prompt (your profile and pasted context) so it isn't reprocessed on every answer. On Opus and Sonnet, requests set `fallbacks: "default"`, so if Claude declines a request it's retried on a fallback model instead of failing. OpenRouter uses its OpenAI-compatible chat completions API, and Gemini uses `streamGenerateContent`. All providers stream into the same answer card.
+With Claude, Assist defaults to **Opus 5.5** at low effort for fast replies (Fable 5.2, Sonnet 5.5 and Haiku 5.5 are in the picker), and caches the system prompt (your profile and pasted context) so it isn't reprocessed on every answer. On Fable, Opus and Sonnet, requests set `fallbacks: "default"`, so if Claude declines a request it's retried on a fallback model instead of failing. OpenRouter uses its OpenAI-compatible chat completions API, and Gemini uses `streamGenerateContent`. All providers stream into the same answer card.
+
+### Following the conversation
+
+Assist keeps a small memory of the meeting next to the transcript: each question the other side asked, what you said back, and who is waiting on whom. It's rebuilt from the transcript every time it's needed, so dropped echoes, merged lines and late punctuation can't leave it stale.
+
+- A new question becomes the current one. A follow-up ("and why did you pick that?") is sent with the earlier questions and your replies, so the model resolves "that" against what you actually said.
+- **Answer** (⌘↩) goes by that state. If they're waiting on you, it answers their question. If you've already started replying, it helps you finish that answer instead of answering from scratch. "Mm-hm" and "okay" from either side don't count as a turn.
+- The transcript keeps the last 500 lines and cloud prompts the last 16,000 characters, but the memory keeps the questions, so the first thing they asked is still there an hour in.
+- Cloud models get the memory as a `<conversation_state>` block. On-device, the transcript in the warm cache is the memory, and the task carries just the last exchange you answered (about 60 tokens), which is what stops a small model answering a bare follow-up about its own earlier suggestion.
+
+### Who said what
+
+The call's audio (ScreenCaptureKit) is "Them" and your mic is "You". Without headphones the mic hears the call too, so there are two layers:
+
+1. **Echo cancellation.** The mic runs through macOS voice processing, which subtracts what the Mac is playing from the mic signal. Ducking is set to minimum so the call stays as loud as it was. If voice processing can't start or delivers no audio, the plain mic takes over. It's a toggle in Settings → General, and it's off in Room mode (mic only), where the mic is the only source.
+2. **Text check.** Whatever still leaks through is compared with what the other side said in the last few seconds: most of its words in one of their lines, or half of its word pairs in their recent speech taken together (the two channels cut utterances at different points). This runs on in-progress text as well, so their words never flash up as yours.
+
+Lines are placed by when the speaker started, not when recognition finished, so a long turn from them doesn't land below your short reply to it.
 
 ### On-device answers
 
@@ -78,6 +97,9 @@ Reproduce them with:
 build/Assist.app/Contents/MacOS/Assist --bench        # LLM: prefill, warm vs cold, MTP, PredGen, turn check
 build/Assist.app/Contents/MacOS/Assist --bench-stt    # Parakeet vs Apple on the same real-time audio
 build/Assist.app/Contents/MacOS/Assist --bench-e2e    # the whole app, speech to answer
+build/Assist.app/Contents/MacOS/Assist --bench-logic  # question tracking, memory, echo and ordering checks (sends nothing)
+build/Assist.app/Contents/MacOS/Assist --bench-mic    # does echo cancellation start and deliver audio on this Mac
+build/Assist.app/Contents/MacOS/Assist --bench-echo   # plays "their" lines out of the speakers and checks none land under "You" (audible, ~1 min)
 ```
 
 The benchmarks use their own settings and never change yours. `--demo`, `--provider=<id>` and `--snapshot=<file.png>` likewise run with throwaway settings.
